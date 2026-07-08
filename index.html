@@ -3,11 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Marketing Tracker v2.63 — ApotekKu</title>
+<title>Marketing Tracker v2.64 — ApotekKu</title>
 <!-- v2.32: SheetJS untuk export Kalender Kerja Bulanan ke Excel -->
-<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <!-- v2.47: Chart.js untuk Dashboard analytics -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<link rel="preconnect" href="https://www.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -2839,7 +2841,8 @@
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js';
 import { getAuth, signInAnonymously, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js';
 import {
-  getFirestore, collection, doc, addDoc, setDoc, getDoc, getDocs, deleteDoc,
+  getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
+  collection, doc, addDoc, setDoc, getDoc, getDocs, deleteDoc,
   onSnapshot, query, where, orderBy, limit, serverTimestamp, updateDoc, arrayUnion, arrayRemove
 } from 'https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js';
 // v2.49: Berkas Penting sekarang LINK-BASED (Google Drive / Dropbox / dll) — Firebase Storage tidak dipakai lagi
@@ -2916,6 +2919,7 @@ const LS_KEYS = {
   NOTIF_SETTINGS: 'marketing_tracker.notifSettings.v1',
   LAST_CHAT_READ_AT: 'marketing_tracker.lastChatReadAt.v1',
   NOTIF_HISTORY: 'marketing_tracker.notifHistory.v1', // v2.51 — history notif yang pernah muncul
+  MINIO_CONFIG: 'marketing_tracker.minioConfig.v1', // v2.64 — config MinIO (cache lokal)
 };
 
 // v2.51 — Notif history config
@@ -3694,6 +3698,173 @@ function saveConfig(cfg) {
   localStorage.setItem(LS_KEYS.FB_CONFIG, JSON.stringify(cfg));
 }
 
+
+/* =============================================================
+   MINIO STORAGE (S3-compatible) — v2.64
+   Upload/hapus/presign langsung dari browser pakai AWS Signature V4
+   (Web Crypto API). Config disimpan di Firestore appConfig/minio
+   supaya seluruh tim otomatis dapat, + cache di localStorage.
+   ============================================================= */
+function getMinioConfig() {
+  if (STATE.minio && STATE.minio.endpoint) return STATE.minio;
+  try {
+    const local = JSON.parse(localStorage.getItem(LS_KEYS.MINIO_CONFIG) || 'null');
+    if (local && local.endpoint) return local;
+  } catch (e) {}
+  return null;
+}
+function minioReady() {
+  const c = getMinioConfig();
+  return !!(c && c.endpoint && c.bucket && c.accessKey && c.secretKey);
+}
+function saveMinioLocal(cfg) {
+  localStorage.setItem(LS_KEYS.MINIO_CONFIG, JSON.stringify(cfg));
+}
+async function saveMinioToFirestore(cfg) {
+  await setDoc(doc(STATE.db, 'appConfig', 'minio'), { ...cfg, updatedAt: serverTimestamp() });
+}
+function subscribeMinioConfig() {
+  try {
+    onSnapshot(doc(STATE.db, 'appConfig', 'minio'), (snap) => {
+      if (snap.exists()) {
+        STATE.minio = snap.data();
+        saveMinioLocal(STATE.minio);
+      }
+      if (STATE.currentView === 'berkas') renderBerkasList();
+    }, (err) => console.warn('MinIO config listener error', err));
+  } catch (e) { console.warn('subscribeMinioConfig gagal', e); }
+}
+async function syncLocalMinioToFirestore() {
+  // Config MinIO yang diisi di setup wizard (sebelum Firebase konek) di-push
+  // ke Firestore sekali — supaya anggota tim lain otomatis kebagian.
+  try {
+    const local = JSON.parse(localStorage.getItem(LS_KEYS.MINIO_CONFIG) || 'null');
+    if (!local || !local.endpoint) return;
+    const snap = await getDoc(doc(STATE.db, 'appConfig', 'minio'));
+    if (!snap.exists()) await saveMinioToFirestore(local);
+  } catch (e) { console.warn('Sync MinIO config gagal:', e); }
+}
+
+// ---- AWS Signature V4 (Web Crypto) ----
+const _minioTE = new TextEncoder();
+async function _mnHmac(keyBytes, msg) {
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, _minioTE.encode(msg)));
+}
+async function _mnSha256Hex(str) {
+  const buf = await crypto.subtle.digest('SHA-256', _minioTE.encode(str));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function _mnHex(bytes) { return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(''); }
+function _mnEnc(str, keepSlash) {
+  let out = encodeURIComponent(str).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  if (keepSlash) out = out.replace(/%2F/g, '/');
+  return out;
+}
+function _mnDates() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  const dateStamp = '' + d.getUTCFullYear() + p(d.getUTCMonth() + 1) + p(d.getUTCDate());
+  const amzDate = dateStamp + 'T' + p(d.getUTCHours()) + p(d.getUTCMinutes()) + p(d.getUTCSeconds()) + 'Z';
+  return { dateStamp, amzDate };
+}
+async function _mnSigningKey(secret, dateStamp, region) {
+  let k = await _mnHmac(_minioTE.encode('AWS4' + secret), dateStamp);
+  k = await _mnHmac(k, region);
+  k = await _mnHmac(k, 's3');
+  k = await _mnHmac(k, 'aws4_request');
+  return k;
+}
+function _mnParts(cfg, objectKey) {
+  const endpoint = cfg.endpoint.replace(/\/+$/, '');
+  const u = new URL(endpoint);
+  const canonicalUri = '/' + _mnEnc(cfg.bucket, false) + '/' + _mnEnc(objectKey, true);
+  return { endpoint, host: u.host, canonicalUri, url: endpoint + canonicalUri };
+}
+async function _mnAuthHeader(method, cfg, parts, amzDate, dateStamp, extraHeaders) {
+  const region = cfg.region || 'us-east-1';
+  const headers = { host: parts.host, 'x-amz-content-sha256': 'UNSIGNED-PAYLOAD', 'x-amz-date': amzDate, ...(extraHeaders || {}) };
+  const names = Object.keys(headers).map(h => h.toLowerCase()).sort();
+  const canonicalHeaders = names.map(h => h + ':' + headers[h] + '\n').join('');
+  const signedHeaders = names.join(';');
+  const canonicalRequest = [method, parts.canonicalUri, '', canonicalHeaders, signedHeaders, 'UNSIGNED-PAYLOAD'].join('\n');
+  const scope = dateStamp + '/' + region + '/s3/aws4_request';
+  const sts = ['AWS4-HMAC-SHA256', amzDate, scope, await _mnSha256Hex(canonicalRequest)].join('\n');
+  const sig = _mnHex(await _mnHmac(await _mnSigningKey(cfg.secretKey, dateStamp, region), sts));
+  return 'AWS4-HMAC-SHA256 Credential=' + cfg.accessKey + '/' + scope + ', SignedHeaders=' + signedHeaders + ', Signature=' + sig;
+}
+
+// Upload file ke MinIO (XHR supaya ada progress bar). Return URL object.
+async function minioPutObject(objectKey, file, onProgress) {
+  const cfg = getMinioConfig();
+  if (!cfg) throw new Error('MinIO belum dikonfigurasi');
+  const parts = _mnParts(cfg, objectKey);
+  const { dateStamp, amzDate } = _mnDates();
+  const contentType = file.type || 'application/octet-stream';
+  const auth = await _mnAuthHeader('PUT', cfg, parts, amzDate, dateStamp, { 'content-type': contentType });
+  await new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', parts.url);
+    xhr.setRequestHeader('Content-Type', contentType);
+    xhr.setRequestHeader('x-amz-content-sha256', 'UNSIGNED-PAYLOAD');
+    xhr.setRequestHeader('x-amz-date', amzDate);
+    xhr.setRequestHeader('Authorization', auth);
+    if (xhr.upload && onProgress) {
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(Math.round(e.loaded / e.total * 100)); };
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else reject(new Error('Upload gagal (HTTP ' + xhr.status + ') — cek kredensial/policy bucket. ' + (xhr.responseText || '').slice(0, 200)));
+    };
+    xhr.onerror = () => reject(new Error('MinIO tidak terjangkau — cek endpoint & setting CORS server MinIO'));
+    xhr.send(file);
+  });
+  return parts.url;
+}
+
+// Hapus object dari MinIO
+async function minioDeleteObject(objectKey) {
+  const cfg = getMinioConfig();
+  if (!cfg) throw new Error('MinIO belum dikonfigurasi');
+  const parts = _mnParts(cfg, objectKey);
+  const { dateStamp, amzDate } = _mnDates();
+  const auth = await _mnAuthHeader('DELETE', cfg, parts, amzDate, dateStamp, null);
+  const res = await fetch(parts.url, {
+    method: 'DELETE',
+    headers: { 'x-amz-content-sha256': 'UNSIGNED-PAYLOAD', 'x-amz-date': amzDate, 'Authorization': auth },
+  });
+  if (!res.ok && res.status !== 404) throw new Error('Hapus object gagal (HTTP ' + res.status + ')');
+}
+
+// Presigned GET URL — file bisa dibuka walau bucket private (default 1 jam, max 7 hari)
+async function minioPresignGet(objectKey, expiresSec) {
+  const cfg = getMinioConfig();
+  if (!cfg) throw new Error('MinIO belum dikonfigurasi');
+  const region = cfg.region || 'us-east-1';
+  const parts = _mnParts(cfg, objectKey);
+  const { dateStamp, amzDate } = _mnDates();
+  const scope = dateStamp + '/' + region + '/s3/aws4_request';
+  const qp = [
+    ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'],
+    ['X-Amz-Credential', cfg.accessKey + '/' + scope],
+    ['X-Amz-Date', amzDate],
+    ['X-Amz-Expires', String(expiresSec || 3600)],
+    ['X-Amz-SignedHeaders', 'host'],
+  ];
+  const canonicalQuery = qp.map(([k, v]) => _mnEnc(k) + '=' + _mnEnc(v)).sort().join('&');
+  const canonicalRequest = ['GET', parts.canonicalUri, canonicalQuery, 'host:' + parts.host + '\n', 'host', 'UNSIGNED-PAYLOAD'].join('\n');
+  const sts = ['AWS4-HMAC-SHA256', amzDate, scope, await _mnSha256Hex(canonicalRequest)].join('\n');
+  const sig = _mnHex(await _mnHmac(await _mnSigningKey(cfg.secretKey, dateStamp, region), sts));
+  return parts.url + '?' + canonicalQuery + '&X-Amz-Signature=' + sig;
+}
+
+async function openMinioFile(f) {
+  try {
+    const link = await minioPresignGet(f.objectKey, 3600);
+    window.open(link, '_blank', 'noopener');
+  } catch (err) { toast('Gagal buka file: ' + err.message, 'error'); }
+}
+
 async function sha256Hex(text) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -3719,7 +3890,16 @@ async function bootstrap() {
   try {
     const app = initializeApp(cfg);
     STATE.auth = getAuth(app);
-    STATE.db = getFirestore(app);
+    // OPTIMASI: persistent cache (IndexedDB) — data tersimpan di device, buka app
+    // berikutnya instan dari cache lalu sinkron diff dari server (hemat kuota reads juga)
+    try {
+      STATE.db = initializeFirestore(app, {
+        localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
+      });
+    } catch (e) {
+      console.warn('Persistent cache tidak tersedia, pakai memory cache:', e);
+      STATE.db = getFirestore(app);
+    }
     // v2.49: Firebase Storage tidak dipakai lagi — Berkas Penting sekarang link-based via Google Drive
     await signInAnonymously(STATE.auth);
     onAuthStateChanged(STATE.auth, (user) => {
@@ -3751,6 +3931,10 @@ async function afterAuth() {
 
   // Background timer untuk reminder
   startReminderTimer();
+
+  // v2.64: config MinIO bersama (dari Firestore) + push config hasil setup wizard
+  subscribeMinioConfig();
+  syncLocalMinioToFirestore();
 
   // Subscribe members; subscribeBoards akan dipanggil setelah members ready
   subscribeMembers();
@@ -3938,7 +4122,7 @@ function subscribeMessages() {
     // Re-render: kalau chat panel lagi open, refresh content; kalau gak, refresh badge di FAB
     if (STATE.currentMember && STATE.boards.length > 0) {
       if (STATE.chatPanelOpen) renderChatMessages();
-      else renderMain(); // refresh badge unread di FAB
+      else refreshChatFabBadge(); // OPTIMASI: update badge saja, gak render ulang seluruh app
     }
   }, (err) => console.error('Messages listener error', err));
 }
@@ -4298,6 +4482,55 @@ function visibleTasks() {
   });
 }
 
+/* =============================================================
+   OPTIMASI PERFORMA — render batching
+   ============================================================= */
+// Debounce render berat: burst perubahan Firestore (local write + server ack,
+// initial cache + server sync) cuma memicu SATU kali render, bukan berkali-kali.
+let _tasksRenderTimer = null;
+function scheduleTasksRender() {
+  if (_tasksRenderTimer) clearTimeout(_tasksRenderTimer);
+  _tasksRenderTimer = setTimeout(applyTasksRender, 80);
+}
+function applyTasksRender() {
+  _tasksRenderTimer = null;
+  renderKanban();
+  if (STATE.currentView === 'recap') renderRecapTabContent();
+  renderProjectList();
+  if (STATE.currentView === 'notdone') renderNotDoneList();
+  updateSidebarBadges();
+  if (typeof kalKerjaInvalidateCache === 'function') kalKerjaInvalidateCache();
+  if (STATE.currentView === 'kalkerja') {
+    const active = document.activeElement;
+    const isEditingCell = active && typeof active.matches === 'function' && active.matches('[data-kk-edit]');
+    if (!isEditingCell) renderKalenderKerjaGrid();
+  }
+  if (STATE.currentView === 'dashboard' && typeof dashboardRefreshData === 'function') {
+    dashboardRefreshData();
+  }
+}
+
+// Update badge unread chat secara surgical — gak perlu render ulang seluruh app
+// tiap ada pesan masuk.
+function refreshChatFabBadge() {
+  const fab = document.getElementById('chat-fab');
+  if (!fab) { renderMain(); return; }
+  const unread = unreadChatCount();
+  let badge = fab.querySelector('.chat-fab-badge');
+  if (unread > 0) {
+    const labelTxt = unread > 99 ? '99+' : String(unread);
+    if (badge) { badge.textContent = labelTxt; }
+    else {
+      badge = document.createElement('span');
+      badge.className = 'chat-fab-badge';
+      badge.textContent = labelTxt;
+      fab.appendChild(badge);
+    }
+  } else if (badge) {
+    badge.remove();
+  }
+}
+
 function subscribeTasks() {
   if (STATE.unsubTasks) STATE.unsubTasks();
   const tasksRef = collection(STATE.db, 'tasks');
@@ -4329,26 +4562,8 @@ function subscribeTasks() {
         const tb = b.createdAt?.toMillis?.() || 0;
         return ta - tb;
       });
-    renderKanban();
-    // v2.26: refresh tab content (table atau calendar) di view recap
-    if (STATE.currentView === 'recap') renderRecapTabContent();
-    renderProjectList();
-    // refresh list "Tidak Selesai" kalau lagi di view itu
-    if (STATE.currentView === 'notdone') renderNotDoneList();
-    // v2.30: refresh sidebar badges (count "Tidak Selesai") real-time
-    updateSidebarBadges();
-    // v2.34: invalidate Kalender Kerja schedule cache & re-render kalau lagi di view itu
-    // v2.46: SKIP re-render kalau user lagi edit cell (preserve typing) — re-render bakal hapus cell DOM-nya
-    if (typeof kalKerjaInvalidateCache === 'function') kalKerjaInvalidateCache();
-    if (STATE.currentView === 'kalkerja') {
-      const active = document.activeElement;
-      const isEditingCell = active && typeof active.matches === 'function' && active.matches('[data-kk-edit]');
-      if (!isEditingCell) renderKalenderKerjaGrid();
-    }
-    // v2.47: refresh dashboard data section (gak destroy chart, cuma update angka)
-    if (STATE.currentView === 'dashboard' && typeof dashboardRefreshData === 'function') {
-      dashboardRefreshData();
-    }
+    // OPTIMASI: render dibatch lewat debounce — lihat scheduleTasksRender()
+    scheduleTasksRender();
 
     // Setelah snapshot pertama, mark flag tasks ready
     if (firstSnap) {
@@ -4574,6 +4789,37 @@ function renderSetupWizard() {
           <label class="label">Paste firebaseConfig JSON</label>
           <textarea id="setup-config-input" class="setup-config-input" placeholder='{ "apiKey": "...", "authDomain": "..." }'></textarea>
         </div>
+
+        <div class="setup-step" style="margin-top:18px">
+          <strong>6. Storage File — MinIO <span style="font-weight:400;color:var(--text-muted)">(opsional)</span></strong>
+          Kalau diisi, tim bisa <strong>upload file langsung</strong> dari menu Berkas Penting ke server MinIO kamu. Kalau dikosongkan, Berkas Penting tetap jalan pakai mode tempel link (Google Drive dll) — dan admin bisa mengisinya belakangan lewat tombol <strong>⚙️ MinIO</strong> di halaman Berkas Penting.
+          <div style="margin-top:6px;font-size:11.5px;color:#92400e;background:#fef3c7;border-radius:6px;padding:8px 10px;line-height:1.5">
+            ⚠️ Server MinIO harus mengizinkan CORS dari domain aplikasi ini (env <code>MINIO_API_CORS_ALLOW_ORIGIN</code>). Disarankan pakai access key khusus dengan policy terbatas ke 1 bucket — key ini akan terlihat oleh seluruh anggota tim.
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <div class="form-group" style="grid-column:1 / -1">
+            <label class="label">Endpoint MinIO</label>
+            <input id="setup-minio-endpoint" class="input" placeholder="https://minio.perusahaan.com  atau  http://203.0.113.10:9000" autocomplete="off">
+          </div>
+          <div class="form-group">
+            <label class="label">Bucket</label>
+            <input id="setup-minio-bucket" class="input" placeholder="marketing-files" autocomplete="off">
+          </div>
+          <div class="form-group">
+            <label class="label">Region</label>
+            <input id="setup-minio-region" class="input" placeholder="us-east-1 (default)" autocomplete="off">
+          </div>
+          <div class="form-group">
+            <label class="label">Access Key</label>
+            <input id="setup-minio-accesskey" class="input" placeholder="AKIA..." autocomplete="off">
+          </div>
+          <div class="form-group">
+            <label class="label">Secret Key</label>
+            <input id="setup-minio-secretkey" class="input" type="password" placeholder="••••••••" autocomplete="off">
+          </div>
+        </div>
+
         <div style="display:flex;gap:8px">
           <button id="setup-save-btn" class="btn btn-primary" style="flex:1">Simpan & Lanjut →</button>
         </div>
@@ -4612,7 +4858,27 @@ function renderSetupWizard() {
         toast('Config tidak valid — apiKey & projectId wajib ada', 'error');
         return;
       }
+      // v2.64: config MinIO (opsional) — validasi dulu sebelum apapun disimpan
+      const mEndpoint = (document.getElementById('setup-minio-endpoint')?.value || '').trim();
+      const mBucket = (document.getElementById('setup-minio-bucket')?.value || '').trim();
+      const mRegion = (document.getElementById('setup-minio-region')?.value || '').trim() || 'us-east-1';
+      const mAk = (document.getElementById('setup-minio-accesskey')?.value || '').trim();
+      const mSk = (document.getElementById('setup-minio-secretkey')?.value || '').trim();
+      const minioFilled = !!(mEndpoint || mBucket || mAk || mSk);
+      if (minioFilled) {
+        if (!(mEndpoint && mBucket && mAk && mSk)) {
+          toast('Config MinIO belum lengkap — isi endpoint, bucket, access key & secret key (atau kosongkan semuanya)', 'error');
+          return;
+        }
+        if (!/^https?:\/\//.test(mEndpoint)) {
+          toast('Endpoint MinIO harus diawali http:// atau https://', 'error');
+          return;
+        }
+      }
       saveConfig(cfg);
+      if (minioFilled) {
+        saveMinioLocal({ endpoint: mEndpoint.replace(/\/+$/, ''), bucket: mBucket, region: mRegion, accessKey: mAk, secretKey: mSk });
+      }
       toast('Config tersimpan, memuat...', 'success');
       setTimeout(() => location.reload(), 600);
     } catch (err) {
@@ -6605,12 +6871,13 @@ function renderBerkasPageHtml() {
         <div style="font-size:13px;color:var(--text-muted);margin-top:4px">Katalog link berkas penting (Google Drive, Sheets, Docs, PDF, dll). File tetap di Drive — sini cuma index supaya tim mudah cari berkas terakhir.</div>
       </div>
       <div class="page-toolbar">
+        ${STATE.currentMember && STATE.currentMember.role === 'admin' ? `<button class="btn btn-ghost" id="btn-minio-setting" title="Konfigurasi storage MinIO">⚙️ MinIO ${minioReady() ? '🟢' : '⚪'}</button>` : ''}
         <button class="btn btn-primary" id="btn-add-berkas">+ Tambah Berkas</button>
       </div>
     </div>
 
     <div style="background:#f0f9ff;border-left:3px solid #0ea5e9;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:12.5px;color:#075985;line-height:1.5">
-      💡 <strong>Cara pakai:</strong> Upload file ke Google Drive (gratis 15GB) → klik <strong>Share</strong> → copy link → klik <strong>+ Tambah Berkas</strong> di sini → paste link. Tipe auto-detect dari URL. Buka langsung di Drive untuk view/edit kolaboratif.
+      💡 <strong>2 cara menambah berkas:</strong> (1) <strong>📤 Upload ke MinIO</strong> — pilih file, langsung tersimpan di server storage tim${minioReady() ? '' : ' <em>(belum aktif — admin perlu isi config lewat tombol ⚙️ MinIO)</em>'}; atau (2) <strong>🔗 Tempel link</strong> Google Drive/Sheets/Docs/URL apa pun. Tipe & icon auto-detect.
     </div>
 
     <div id="berkas-list-root"></div>
@@ -6620,7 +6887,92 @@ function renderBerkasPageHtml() {
 function bindBerkasPage() {
   const addBtn = document.getElementById('btn-add-berkas');
   if (addBtn) addBtn.addEventListener('click', () => openBerkasModal());
+  const minioBtn = document.getElementById('btn-minio-setting');
+  if (minioBtn) minioBtn.addEventListener('click', () => openMinioSettingModal());
   renderBerkasList();
+}
+
+// v2.64: modal konfigurasi MinIO (admin) — tersimpan di Firestore appConfig/minio,
+// otomatis tersinkron ke seluruh anggota tim.
+function openMinioSettingModal() {
+  const c = getMinioConfig() || {};
+  const html = `
+    <div class="modal-header">
+      <h2 class="modal-title">⚙️ Konfigurasi Storage MinIO</h2>
+      <button class="modal-close" data-close-modal>&times;</button>
+    </div>
+    <div class="modal-body" style="padding:20px">
+      <div style="background:#fef3c7;border-left:3px solid #f59e0b;padding:10px 14px;border-radius:6px;margin-bottom:14px;font-size:12px;color:#92400e;line-height:1.5">
+        ⚠️ Server MinIO wajib mengizinkan CORS dari domain aplikasi ini (env <code>MINIO_API_CORS_ALLOW_ORIGIN</code>, atau <code>*</code>). Gunakan access key khusus ber-policy terbatas ke 1 bucket — key ini tersimpan di database tim dan terlihat oleh semua anggota.
+      </div>
+      <div class="form-group">
+        <label class="label">Endpoint MinIO <span style="color:#dc2626">*</span></label>
+        <input id="mn-endpoint" class="input" placeholder="https://minio.perusahaan.com atau http://203.0.113.10:9000" value="${escapeHtml(c.endpoint || '')}" autocomplete="off">
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <div class="form-group">
+          <label class="label">Bucket <span style="color:#dc2626">*</span></label>
+          <input id="mn-bucket" class="input" placeholder="marketing-files" value="${escapeHtml(c.bucket || '')}" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label class="label">Region</label>
+          <input id="mn-region" class="input" placeholder="us-east-1 (default)" value="${escapeHtml(c.region || '')}" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label class="label">Access Key <span style="color:#dc2626">*</span></label>
+          <input id="mn-accesskey" class="input" value="${escapeHtml(c.accessKey || '')}" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label class="label">Secret Key <span style="color:#dc2626">*</span></label>
+          <input id="mn-secretkey" class="input" type="password" value="${escapeHtml(c.secretKey || '')}" autocomplete="off">
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" data-close-modal>Batal</button>
+      <button class="btn btn-ghost" id="mn-test">🔌 Tes Koneksi</button>
+      <button class="btn btn-primary" id="mn-save">Simpan</button>
+    </div>
+  `;
+  showModal(html, { size: 'md' });
+  function readForm() {
+    const endpoint = document.getElementById('mn-endpoint').value.trim().replace(/\/+$/, '');
+    const bucket = document.getElementById('mn-bucket').value.trim();
+    const region = document.getElementById('mn-region').value.trim() || 'us-east-1';
+    const accessKey = document.getElementById('mn-accesskey').value.trim();
+    const secretKey = document.getElementById('mn-secretkey').value.trim();
+    if (!endpoint || !bucket || !accessKey || !secretKey) { toast('Endpoint, bucket, access key & secret key wajib diisi', 'error'); return null; }
+    if (!/^https?:\/\//.test(endpoint)) { toast('Endpoint harus diawali http:// atau https://', 'error'); return null; }
+    return { endpoint, bucket, region, accessKey, secretKey };
+  }
+  document.getElementById('mn-test').addEventListener('click', async () => {
+    const cfg = readForm(); if (!cfg) return;
+    const btn = document.getElementById('mn-test');
+    btn.disabled = true; btn.textContent = 'Menguji...';
+    const prev = STATE.minio; STATE.minio = cfg;
+    try {
+      const testKey = 'berkas/_tes-koneksi-' + Date.now() + '.txt';
+      await minioPutObject(testKey, new Blob(['tes koneksi marketing tracker'], { type: 'text/plain' }), null);
+      try { await minioDeleteObject(testKey); } catch (e) {}
+      toast('✅ Koneksi MinIO OK — upload & hapus berhasil', 'success');
+    } catch (err) {
+      toast('❌ ' + err.message, 'error');
+    } finally {
+      STATE.minio = prev;
+      btn.disabled = false; btn.textContent = '🔌 Tes Koneksi';
+    }
+  });
+  document.getElementById('mn-save').addEventListener('click', async () => {
+    const cfg = readForm(); if (!cfg) return;
+    try {
+      await saveMinioToFirestore(cfg);
+      saveMinioLocal(cfg);
+      STATE.minio = cfg;
+      toast('Config MinIO tersimpan — berlaku untuk seluruh tim', 'success');
+      closeModal();
+      renderMainSafe();
+    } catch (err) { toast('Gagal simpan: ' + err.message, 'error'); }
+  });
 }
 
 function renderBerkasList() {
@@ -6656,7 +7008,10 @@ function renderBerkasList() {
           ${f.description ? `<div style="font-size:11.5px;color:var(--text-muted);line-height:1.4;margin-top:4px">${escapeHtml(f.description)}</div>` : ''}
         </div>
         <div style="display:flex;gap:6px;flex-shrink:0">
-          <a href="${escapeHtml(f.url)}" target="_blank" rel="noopener" class="btn btn-primary btn-sm">🔗 Buka</a>
+          ${f.storage === 'minio' && f.objectKey
+            ? `<button class="btn btn-primary btn-sm" data-berkas-open-minio="${f.id}">📥 Buka</button>
+               <button class="btn btn-ghost btn-sm" data-berkas-copy-minio="${f.id}" title="Salin link share (berlaku 7 hari)">📋</button>`
+            : `<a href="${escapeHtml(f.url)}" target="_blank" rel="noopener" class="btn btn-primary btn-sm">🔗 Buka</a>`}
           <button class="btn btn-ghost btn-sm" data-berkas-edit="${f.id}">✏️</button>
           <button class="btn btn-ghost btn-sm" data-berkas-del="${f.id}" style="color:#dc2626">🗑️</button>
         </div>
@@ -6669,10 +7024,18 @@ function renderBerkasList() {
       const id = btn.dataset.berkasDel;
       const f = STATE.files.find(x => x.id === id);
       if (!f) return;
-      if (!confirm(`Hapus berkas "${f.name}"?\n\nNote: ini cuma hapus dari index Marketing Tracker — file asli di Google Drive tetap utuh.`)) return;
+      const isMinioFile = f.storage === 'minio' && f.objectKey;
+      const confirmMsg = isMinioFile
+        ? `Hapus berkas "${f.name}"?\n\nFile FISIK di server MinIO juga akan ikut terhapus.`
+        : `Hapus berkas "${f.name}"?\n\nNote: ini cuma hapus dari index Marketing Tracker — file asli di Google Drive tetap utuh.`;
+      if (!confirm(confirmMsg)) return;
       try {
+        if (isMinioFile && minioReady()) {
+          try { await minioDeleteObject(f.objectKey); }
+          catch (e) { console.warn('Gagal hapus object MinIO (index tetap dihapus):', e); }
+        }
         await deleteDoc(doc(STATE.db, 'importantFiles', f.id));
-        toast('Berkas dihapus dari index', 'success');
+        toast('Berkas dihapus', 'success');
       } catch (err) { toast('Gagal hapus: ' + err.message, 'error'); }
     });
   });
@@ -6683,6 +7046,27 @@ function renderBerkasList() {
       if (f) openBerkasModal(f);
     });
   });
+  // v2.64: file MinIO — buka via presigned URL (aman walau bucket private)
+  root.querySelectorAll('[data-berkas-open-minio]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const f = STATE.files.find(x => x.id === btn.dataset.berkasOpenMinio);
+      if (!f) return;
+      if (!minioReady()) { toast('Config MinIO belum diisi — hubungi admin', 'error'); return; }
+      openMinioFile(f);
+    });
+  });
+  root.querySelectorAll('[data-berkas-copy-minio]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const f = STATE.files.find(x => x.id === btn.dataset.berkasCopyMinio);
+      if (!f) return;
+      if (!minioReady()) { toast('Config MinIO belum diisi — hubungi admin', 'error'); return; }
+      try {
+        const link = await minioPresignGet(f.objectKey, 604800); // 7 hari (maks S3)
+        await navigator.clipboard.writeText(link);
+        toast('Link disalin — berlaku 7 hari', 'success');
+      } catch (err) { toast('Gagal salin link: ' + err.message, 'error'); }
+    });
+  });
 }
 
 function openBerkasModal(existing) {
@@ -6690,6 +7074,11 @@ function openBerkasModal(existing) {
   if (!me) return;
   const isEdit = !!existing;
   const f = existing || {};
+  const isMinioFile = isEdit && f.storage === 'minio';
+  const canUpload = minioReady();
+  // Mode: 'link' | 'upload' — default upload kalau MinIO aktif (tambah baru)
+  let mode = isEdit ? (isMinioFile ? 'minio-edit' : 'link') : (canUpload ? 'upload' : 'link');
+
   const html = `
     <div class="modal-header">
       <h2 class="modal-title">${isEdit ? '✏️ Edit Berkas' : '+ Tambah Berkas Penting'}</h2>
@@ -6697,22 +7086,53 @@ function openBerkasModal(existing) {
     </div>
     <div class="modal-body" style="padding:20px">
       ${!isEdit ? `
-        <div style="background:#fef3c7;border-left:3px solid #f59e0b;padding:10px 14px;border-radius:6px;margin-bottom:14px;font-size:12px;color:#92400e;line-height:1.5">
-          💡 <strong>Tip:</strong> di Google Drive, klik kanan file → <strong>Share</strong> → ubah ke "Anyone with the link" (atau spesifik ke email tim) → copy link → paste di bawah.
+        <div style="display:flex;gap:6px;margin-bottom:16px">
+          <button class="btn ${mode === 'upload' ? 'btn-primary' : 'btn-ghost'}" id="b-mode-upload" style="flex:1" ${canUpload ? '' : 'disabled title="MinIO belum dikonfigurasi — admin bisa isi lewat tombol ⚙️ MinIO"'}>📤 Upload ke MinIO${canUpload ? '' : ' (nonaktif)'}</button>
+          <button class="btn ${mode === 'link' ? 'btn-primary' : 'btn-ghost'}" id="b-mode-link" style="flex:1">🔗 Tempel Link</button>
         </div>
       ` : ''}
+
       <div class="form-group">
         <label class="label">Nama Berkas <span style="color:#dc2626">*</span></label>
         <input type="text" id="b-name" class="input" placeholder="Mis: Rekap Iklan Juli 2026" value="${escapeHtml(f.name || '')}" autofocus>
       </div>
-      <div class="form-group">
-        <label class="label">Link / URL Berkas <span style="color:#dc2626">*</span></label>
-        <input type="url" id="b-url" class="input" placeholder="https://docs.google.com/spreadsheets/d/..." value="${escapeHtml(f.url || '')}">
-        <div style="font-size:11px;color:var(--text-muted);margin-top:4px">Tipe & icon akan auto-detect dari URL.</div>
-        <div id="b-preview-type" style="margin-top:8px;font-size:12px;color:var(--text-muted);display:none">
-          Tipe terdeteksi: <span id="b-preview-label" style="font-weight:600"></span>
+
+      <div id="b-section-upload" style="display:${mode === 'upload' ? 'block' : 'none'}">
+        <div class="form-group">
+          <label class="label">Pilih File <span style="color:#dc2626">*</span></label>
+          <input type="file" id="b-file" class="input" style="padding:8px">
+          <div id="b-file-info" style="font-size:11.5px;color:var(--text-muted);margin-top:4px;display:none"></div>
+        </div>
+        <div id="b-upload-progress" style="display:none;margin-bottom:12px">
+          <div style="height:8px;background:#e5e7eb;border-radius:100px;overflow:hidden">
+            <div id="b-upload-bar" style="height:100%;width:0%;background:var(--primary);border-radius:100px;transition:width .2s"></div>
+          </div>
+          <div id="b-upload-pct" style="font-size:11.5px;color:var(--text-muted);margin-top:4px">0%</div>
         </div>
       </div>
+
+      <div id="b-section-link" style="display:${mode === 'link' ? 'block' : 'none'}">
+        ${!isEdit ? `
+          <div style="background:#fef3c7;border-left:3px solid #f59e0b;padding:10px 14px;border-radius:6px;margin-bottom:14px;font-size:12px;color:#92400e;line-height:1.5">
+            💡 <strong>Tip:</strong> di Google Drive, klik kanan file → <strong>Share</strong> → ubah ke "Anyone with the link" (atau spesifik ke email tim) → copy link → paste di bawah.
+          </div>
+        ` : ''}
+        <div class="form-group">
+          <label class="label">Link / URL Berkas <span style="color:#dc2626">*</span></label>
+          <input type="url" id="b-url" class="input" placeholder="https://docs.google.com/spreadsheets/d/..." value="${escapeHtml(isMinioFile ? '' : (f.url || ''))}">
+          <div style="font-size:11px;color:var(--text-muted);margin-top:4px">Tipe & icon akan auto-detect dari URL.</div>
+          <div id="b-preview-type" style="margin-top:8px;font-size:12px;color:var(--text-muted);display:none">
+            Tipe terdeteksi: <span id="b-preview-label" style="font-weight:600"></span>
+          </div>
+        </div>
+      </div>
+
+      ${isMinioFile ? `
+        <div style="background:#f0f9ff;border-left:3px solid #0ea5e9;padding:10px 14px;border-radius:6px;margin-bottom:14px;font-size:12px;color:#075985;line-height:1.5">
+          📦 File ini tersimpan di MinIO (<code>${escapeHtml(f.objectKey || '')}</code>). Yang bisa diedit: nama & keterangan. Untuk mengganti file-nya, hapus lalu upload ulang.
+        </div>
+      ` : ''}
+
       <div class="form-group">
         <label class="label">Keterangan (opsional)</label>
         <textarea id="b-desc" class="textarea" rows="3" placeholder="Catatan tambahan, mis: versi/periode/konteks">${escapeHtml(f.description || '')}</textarea>
@@ -6724,25 +7144,112 @@ function openBerkasModal(existing) {
     </div>
   `;
   showModal(html, { size: 'md' });
+
+  // Toggle mode (hanya saat tambah baru)
+  const secUpload = document.getElementById('b-section-upload');
+  const secLink = document.getElementById('b-section-link');
+  const btnModeUp = document.getElementById('b-mode-upload');
+  const btnModeLink = document.getElementById('b-mode-link');
+  function setMode(m) {
+    mode = m;
+    if (secUpload) secUpload.style.display = m === 'upload' ? 'block' : 'none';
+    if (secLink) secLink.style.display = m === 'link' ? 'block' : 'none';
+    if (btnModeUp) { btnModeUp.className = 'btn ' + (m === 'upload' ? 'btn-primary' : 'btn-ghost'); btnModeUp.style.flex = '1'; }
+    if (btnModeLink) { btnModeLink.className = 'btn ' + (m === 'link' ? 'btn-primary' : 'btn-ghost'); btnModeLink.style.flex = '1'; }
+  }
+  if (btnModeUp && canUpload) btnModeUp.addEventListener('click', () => setMode('upload'));
+  if (btnModeLink) btnModeLink.addEventListener('click', () => setMode('link'));
+
+  // Upload: tampilkan info file & auto-isi nama dari nama file
+  const fileInput = document.getElementById('b-file');
+  const nameInput = document.getElementById('b-name');
+  if (fileInput) {
+    fileInput.addEventListener('change', () => {
+      const file = fileInput.files && fileInput.files[0];
+      const info = document.getElementById('b-file-info');
+      if (!file) { if (info) info.style.display = 'none'; return; }
+      if (info) {
+        const mb = (file.size / 1048576).toFixed(2);
+        const t = berkasDetectType(file.name);
+        info.style.display = 'block';
+        info.textContent = `${t.icon} ${file.name} — ${mb} MB`;
+      }
+      if (nameInput && !nameInput.value.trim()) {
+        nameInput.value = file.name.replace(/\.[^.]+$/, '');
+      }
+    });
+  }
+
   // Live preview tipe saat user paste URL
   const urlInput = document.getElementById('b-url');
   const previewBox = document.getElementById('b-preview-type');
   const previewLabel = document.getElementById('b-preview-label');
   function updatePreview() {
+    if (!urlInput || !previewBox) return;
     const u = urlInput.value.trim();
     if (!u) { previewBox.style.display = 'none'; return; }
     const t = berkasDetectType(u);
     previewBox.style.display = 'block';
     previewLabel.textContent = `${t.icon} ${t.label}`;
   }
-  urlInput.addEventListener('input', updatePreview);
-  updatePreview();
+  if (urlInput) { urlInput.addEventListener('input', updatePreview); updatePreview(); }
+
   // Save
   document.getElementById('b-save').addEventListener('click', async () => {
     const name = document.getElementById('b-name').value.trim();
-    const url = document.getElementById('b-url').value.trim();
     const desc = document.getElementById('b-desc').value.trim();
     if (!name) { toast('Nama berkas wajib', 'error'); return; }
+    const saveBtn = document.getElementById('b-save');
+
+    // === MODE UPLOAD ke MinIO (tambah baru) ===
+    if (!isEdit && mode === 'upload') {
+      const file = fileInput && fileInput.files && fileInput.files[0];
+      if (!file) { toast('Pilih file dulu', 'error'); return; }
+      if (file.size > 200 * 1048576) { toast('File terlalu besar (maks 200 MB)', 'error'); return; }
+      const safeName = file.name.replace(/[^\w.\-]+/g, '_').slice(-100);
+      const d = new Date();
+      const objectKey = `berkas/${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${Date.now()}_${safeName}`;
+      const progWrap = document.getElementById('b-upload-progress');
+      const progBar = document.getElementById('b-upload-bar');
+      const progPct = document.getElementById('b-upload-pct');
+      saveBtn.disabled = true; saveBtn.textContent = 'Mengupload...';
+      if (progWrap) progWrap.style.display = 'block';
+      try {
+        const url = await minioPutObject(objectKey, file, (pct) => {
+          if (progBar) progBar.style.width = pct + '%';
+          if (progPct) progPct.textContent = pct + '%';
+        });
+        const t = berkasDetectType(file.name);
+        await addDoc(collection(STATE.db, 'importantFiles'), {
+          name, url, description: desc,
+          storage: 'minio', objectKey,
+          size: file.size, contentType: file.type || '',
+          ext: t.ext, icon: t.icon, typeLabel: t.label,
+          uploadedById: me.id, uploadedByName: me.name,
+          uploadedAt: serverTimestamp(), updatedAt: serverTimestamp(),
+        });
+        toast('File terupload ke MinIO ✅', 'success');
+        closeModal();
+      } catch (err) {
+        toast('Gagal upload: ' + err.message, 'error');
+        saveBtn.disabled = false; saveBtn.textContent = 'Simpan';
+        if (progWrap) progWrap.style.display = 'none';
+      }
+      return;
+    }
+
+    // === MODE EDIT file MinIO (nama & keterangan saja) ===
+    if (isEdit && isMinioFile) {
+      try {
+        await updateDoc(doc(STATE.db, 'importantFiles', existing.id), { name, description: desc, updatedAt: serverTimestamp() });
+        toast('Berkas diupdate', 'success');
+        closeModal();
+      } catch (err) { toast('Gagal: ' + err.message, 'error'); }
+      return;
+    }
+
+    // === MODE LINK (perilaku lama) ===
+    const url = document.getElementById('b-url').value.trim();
     if (!url) { toast('Link/URL wajib', 'error'); return; }
     if (!isValidBerkasUrl(url)) { toast('URL tidak valid (harus http:// atau https://)', 'error'); return; }
     const t = berkasDetectType(url);
@@ -13004,7 +13511,7 @@ function buildExportObject(d) {
   return {
     export_meta: {
       exported_at: new Date().toISOString(),
-      app_version: 'v2.63-mkt',
+      app_version: 'v2.64-mkt-minio',
       range: { from: d.from, to: d.to },
       filter_member: d.memberLabel,
       filter_category: d.categoryFilter || 'Semua',
@@ -13417,7 +13924,7 @@ async function exportAsXlsx(filename, d) {
   const metaRows = [
     ['META EXPORT'],
     ['Exported At', new Date().toISOString()],
-    ['App Version', 'v2.63-mkt'],
+    ['App Version', 'v2.64-mkt-minio'],
     ['Range From', d.from],
     ['Range To', d.to],
     ['Filter Anggota', d.memberLabel || 'Semua'],
